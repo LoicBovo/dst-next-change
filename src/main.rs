@@ -76,16 +76,17 @@ async fn dst_calculation() -> Result< (), String> {
 
     let future_vec : Vec<_> = list_tz
         .iter()
-        .map(|time_zone| task::spawn(get_next_dst_change(time_zone.to_string())))
+        .map(|time_zone| task::spawn(get_dst_change(time_zone.to_string())))
         .collect();
 
     let responses = futures::future::join_all(future_vec).await;
-    let mut dst_to_save : Vec<DstChange> = Vec::new();
+
+    let mut dst_to_save : Vec<Vec<DstChange>> = Vec::new();
+    
     for response in responses {
         match response {
             Ok(result) => match result {
                 Ok(dst) => {
-                    println!("Next dst change for {}: {:?}", dst.timezone_name, dst.next_dst_change);
                     dst_to_save.push(dst);
                 },
                 Err(error) => println!("Error getting next dst change for tz {}, for reason: {}", error.timezone_name, error.reason),
@@ -107,25 +108,27 @@ async fn dst_calculation() -> Result< (), String> {
 /// save to db takes a dst change list and save it to dyndb
 /// this is only doing the save
 /// later improvment can be to make a batch
-async fn save_to_db(dst_to_save : Vec<DstChange>) -> Result<String, String> {
+async fn save_to_db(dst_to_save : Vec<Vec<DstChange>>) -> Result<String, String> {
     let shared_config = aws_config::from_env().load().await;
     let dyn_client = aws_sdk_dynamodb::Client::new(&shared_config);
     
     for dst in dst_to_save {
         let mut maps: HashMap<String, AttributeValue> = HashMap::new();
-        maps.insert("timezone_name".to_string(), AttributeValue::S(dst.timezone_name.clone()));
-        maps.insert("next_dst_change".to_string(), AttributeValue::S(dst.next_dst_change.to_string()));
+        maps.insert("timezone_name".to_string(), AttributeValue::S(dst[0].timezone_name.clone()));
+        maps.insert("next_dst_change".to_string(), AttributeValue::S(dst[0].next_dst_change.to_string()));
+        maps.insert("second_dst_change".to_string(), AttributeValue::S(dst[1].next_dst_change.to_string()));
         
         // todo: set the proper table name
         let result = dyn_client
             .put_item()
+            .table_name("dst_change")
             .set_item(Some(maps))
             .send()
             .await;
 
         match result {
-            Ok(message) => println!("tz inserted with success {}, with details {:?}", dst.timezone_name, message),
-            Err(error) => println!("error inserting tz {} with details: {:?}", dst.timezone_name, error),
+            Ok(message) => println!("tz inserted with success {}, with details {:?}", dst[0].timezone_name, message),
+            Err(error) => println!("error inserting tz {} with details: {:?}", dst[0].timezone_name, error),
         }
     }
 
@@ -135,7 +138,7 @@ async fn save_to_db(dst_to_save : Vec<DstChange>) -> Result<String, String> {
 /// get next dst change take a time zone name and return the next dst based
 /// on date time now an improvment can be to make it based on a passed date
 /// so you can use the same script for the next two
-async fn get_next_dst_change(time_zone_name: String) -> Result<DstChange,DstError> {
+async fn get_dst_change(time_zone_name: String) -> Result<Vec<DstChange>,DstError> {
     let tz = time_zone_name.parse();
 
     let tz: Tz = match tz {
@@ -148,7 +151,29 @@ async fn get_next_dst_change(time_zone_name: String) -> Result<DstChange,DstErro
 
     let current_utc_date = Utc::now();
     let current_local_date = current_utc_date.with_timezone(&tz);
-    let mut dst_time = current_local_date.clone();
+    
+    let mut dst_changes: Vec<DstChange> = Vec::new();
+    // find next one
+    match get_next_dst_change(current_local_date){
+        Ok(dst_change) => {
+            match get_next_dst_change(dst_change.next_dst_change){
+                Ok(dst_change2) => dst_changes.push(dst_change2),
+                Err(err) => println!("error with dst: {}",err.timezone_name)
+            };
+            dst_changes.push(dst_change);
+        },
+        Err(error) => {
+            println!("error with the timezone: {} for the following reason {}", error.timezone_name, error.reason);
+            return Err(error);
+        }
+    };
+
+    Ok(dst_changes)
+
+}
+
+fn get_next_dst_change(date_time: DateTime<Tz>) -> Result<DstChange, DstError> {
+    let mut dst_time = date_time.clone();
     
     let one_day = Duration::days(1);
     let one_quarter = Duration::days(90);
@@ -159,34 +184,34 @@ async fn get_next_dst_change(time_zone_name: String) -> Result<DstChange,DstErro
     let mut counter : i16 = 0;
 
     // find next quarter when it changes
-    while current_local_date.offset().dst_offset() == dst_time.offset().dst_offset() {
+    while date_time.offset().dst_offset() == dst_time.offset().dst_offset() {
         dst_time = dst_time + one_quarter;
         counter = counter + 1;
         
         if counter == 4 {
             return Err(DstError{
-                timezone_name: time_zone_name,
+                timezone_name: date_time.timezone().to_string(),
                 reason: String::from("no dst change")
             });
         }
     }
 
     // find the month
-    while current_local_date.offset().dst_offset() != dst_time.offset().dst_offset() {
+    while date_time.offset().dst_offset() != dst_time.offset().dst_offset() {
         dst_time = dst_time - one_month;
     }
 
     // find the day
-    while current_local_date.offset().dst_offset() == dst_time.offset().dst_offset() {
+    while date_time.offset().dst_offset() == dst_time.offset().dst_offset() {
         dst_time = dst_time + one_day;
     }
     // find the hour
-    while current_local_date.offset().dst_offset() != dst_time.offset().dst_offset() {
+    while date_time.offset().dst_offset() != dst_time.offset().dst_offset() {
         dst_time = dst_time - one_hour;
     }
 
     // find the minute
-    while current_local_date.offset().dst_offset() == dst_time.offset().dst_offset() {
+    while date_time.offset().dst_offset() == dst_time.offset().dst_offset() {
         dst_time = dst_time + one_minute;
     }
 
@@ -194,7 +219,7 @@ async fn get_next_dst_change(time_zone_name: String) -> Result<DstChange,DstErro
     dst_time = dst_time - one_minute;
 
     Ok(DstChange {
-        timezone_name : time_zone_name,
+        timezone_name : date_time.timezone().to_string(),
         next_dst_change : dst_time
     })
 }
