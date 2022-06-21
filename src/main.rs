@@ -47,7 +47,6 @@ async fn main() -> Result<(), Error> {
 async fn dst_calculation() -> Result< (), String> {
     use std::time::Instant;
     let now = Instant::now();
-    println!("hello rust dst");
 
     let list_tz = [
         "Australia/Adelaide",
@@ -132,7 +131,7 @@ async fn save_to_db(dst_to_save : Vec<Vec<DstChange>>) -> Result<String, String>
         }
     }
 
-    Err(String::from("not implemented"))
+    Ok(String::from("success"))
 }
 
 /// get next dst change take a time zone name and return the next dst based
